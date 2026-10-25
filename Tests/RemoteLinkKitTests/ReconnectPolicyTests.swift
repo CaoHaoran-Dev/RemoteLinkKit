@@ -14,7 +14,12 @@ final class ReconnectPolicyTests: XCTestCase {
         XCTAssertEqual(policy.delay(forAttempt: 0), 1)
         XCTAssertEqual(policy.delay(forAttempt: 1), 2)
         XCTAssertEqual(policy.delay(forAttempt: 2), 4)
-        XCTAssertEqual(policy.delay(forAttempt: 5), 30)   // 封顶
-        XCTAssertNil(policy.delay(forAttempt: 10))        // 超次数
+        XCTAssertEqual(policy.delay(forAttempt: 5), 30)
+        XCTAssertNil(policy.delay(forAttempt: 10))
+    }
+
+    func testZeroAttemptsAlwaysNil() {
+        let policy = ReconnectPolicy(maxAttempts: 0)
+        XCTAssertNil(policy.delay(forAttempt: 0))
     }
 }
