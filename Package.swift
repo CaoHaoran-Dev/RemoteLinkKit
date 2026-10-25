@@ -11,13 +11,27 @@ let package = Package(
         .library(
             name: "RemoteLinkKit",
             targets: ["RemoteLinkKit"]
+        ),
+        .library(
+            name: "RemoteProcessProtocol",
+            targets: ["RemoteProcessProtocol"]
         )
     ],
     targets: [
-        .target(name: "RemoteLinkKit"),
+        .target(
+            name: "RemoteLinkKit"
+        ),
+        .target(
+            name: "RemoteProcessProtocol",
+            dependencies: ["RemoteLinkKit"]
+        ),
         .testTarget(
             name: "RemoteLinkKitTests",
             dependencies: ["RemoteLinkKit"]
+        ),
+        .testTarget(
+            name: "RemoteProcessProtocolTests",
+            dependencies: ["RemoteProcessProtocol"]
         )
     ]
 )
