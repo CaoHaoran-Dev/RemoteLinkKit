@@ -10,8 +10,11 @@ import Foundation
 import Network
 
 /// 最小 HTTP/1.1 解析，挂到 NWListener 上，把请求转成回调。
-/// TODO: 实现解析和分发
+/// 只支持 Content-Length，不支持 chunked。
 public final class HTTPPairingServer: @unchecked Sendable {
+
+    // MARK: - Request / Response
+
     public struct Request: Sendable {
         public let method: String
         public let path: String
@@ -19,12 +22,211 @@ public final class HTTPPairingServer: @unchecked Sendable {
         public let body: Data
     }
 
-    public typealias Handler = @Sendable (Request) -> (status: Int, body: Data)
+    public struct Response: Sendable {
+        public let status: Int
+        public let headers: [String: String]
+        public let body: Data
+
+        public init(status: Int,
+                    headers: [String: String] = ["Content-Type": "application/json"],
+                    body: Data = Data()) {
+            self.status = status
+            self.headers = headers
+            self.body = body
+        }
+    }
+
+    public typealias Handler = @Sendable (Request) -> Response
+
+    // MARK: - Private
 
     private let handler: Handler
+    private let queue = DispatchQueue(label: "com.remotelinkkit.httpserver")
+
+    private let lock = NSLock()
+    private var listener: NWListener?
+    private var connections: [ObjectIdentifier: NWConnection] = [:]
+
+    // MARK: - Init
 
     public init(handler: @escaping Handler) {
         self.handler = handler
+    }
+
+    // MARK: - Start / Stop
+
+    public func start(port: UInt16) throws {
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+
+        let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.handleNewConnection(connection)
+        }
+        listener.start(queue: queue)
+
+        lock.withLock { self.listener = listener }
+    }
+
+    public func stop() {
+        let (l, conns): (NWListener?, [NWConnection]) = lock.withLock {
+            let l = listener
+            let c = Array(connections.values)
+            listener = nil
+            connections.removeAll()
+            return (l, c)
+        }
+
+        l?.cancel()
+        conns.forEach { $0.cancel() }
+    }
+
+    // MARK: - Connection
+
+    private func handleNewConnection(_ connection: NWConnection) {
+        lock.withLock { connections[ObjectIdentifier(connection)] = connection }
+
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled:
+                self?.lock.withLock {
+                    _ = self?.connections.removeValue(forKey: ObjectIdentifier(connection))
+                }
+            default:
+                break
+            }
+        }
+
+        connection.start(queue: queue)
+        receive(on: connection, buffer: Data())
+    }
+
+    private func receive(on connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self = self else { return }
+
+            if error != nil {
+                self.closeConnection(connection)
+                return
+            }
+
+            var buffer = buffer
+            if let data = data {
+                buffer.append(data)
+            }
+
+            if let parsed = self.tryParseRequest(buffer) {
+                let response = self.handler(parsed.request)
+
+                // WebSocket 升级不在这里处理，直接断
+                // （WebSocket 由独立 listener + NWProtocolWebSocket 处理）
+                if parsed.request.headers["upgrade"]?.lowercased() == "websocket" {
+                    self.closeConnection(connection)
+                    return
+                }
+
+                self.sendResponse(response, on: connection) {
+                    self.closeConnection(connection)
+                }
+            } else if isComplete {
+                self.closeConnection(connection)
+            } else {
+                self.receive(on: connection, buffer: buffer)
+            }
+        }
+    }
+
+    // MARK: - HTTP Parse
+
+    private struct ParsedRequest {
+        let request: Request
+        let consumed: Int
+    }
+
+    private func tryParseRequest(_ buffer: Data) -> ParsedRequest? {
+        let headerEnd = Data([0x0D, 0x0A, 0x0D, 0x0A])
+        guard let headerRange = buffer.range(of: headerEnd) else { return nil }
+
+        let headerData = buffer[..<headerRange.lowerBound]
+        guard let headerString = String(data: headerData, encoding: .utf8) else { return nil }
+
+        let lines = headerString.components(separatedBy: "\r\n")
+        guard let requestLine = lines.first else { return nil }
+
+        let parts = requestLine.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+        guard parts.count >= 2 else { return nil }
+
+        let method = String(parts[0]).uppercased()
+        let path = String(parts[1])
+
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let key = String(line[..<colon]).trimmingCharacters(in: .whitespaces).lowercased()
+            let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+            headers[key] = value
+        }
+
+        let contentLength = Int(headers["content-length"] ?? "0") ?? 0
+        let bodyStart = headerRange.upperBound
+        let bodyEnd = bodyStart + contentLength
+
+        guard buffer.count >= bodyEnd else { return nil }
+
+        let body = buffer[bodyStart..<bodyEnd]
+        let request = Request(method: method, path: path, headers: headers, body: Data(body))
+        return ParsedRequest(request: request, consumed: bodyEnd)
+    }
+
+    // MARK: - Send Response
+
+    private func sendResponse(_ response: Response, on connection: NWConnection, completion: @escaping () -> Void) {
+        var headerLines: [String] = []
+        headerLines.append("HTTP/1.1 \(response.status) \(Self.statusText(response.status))")
+
+        var headers = response.headers
+        headers["Content-Length"] = "\(response.body.count)"
+        headers["Connection"] = "close"
+
+        for (key, value) in headers {
+            headerLines.append("\(key): \(value)")
+        }
+        headerLines.append("")
+        headerLines.append("")
+
+        var data = Data(headerLines.joined(separator: "\r\n").utf8)
+        data.append(response.body)
+
+        connection.send(
+            content: data,
+            completion: .contentProcessed { _ in
+                completion()
+            }
+        )
+    }
+
+    private func closeConnection(_ connection: NWConnection) {
+        connection.cancel()
+        lock.withLock {
+            _ = connections.removeValue(forKey: ObjectIdentifier(connection))
+        }
+    }
+
+    // MARK: - Status Text
+
+    private static func statusText(_ code: Int) -> String {
+        switch code {
+        case 200: return "OK"
+        case 400: return "Bad Request"
+        case 401: return "Unauthorized"
+        case 403: return "Forbidden"
+        case 404: return "Not Found"
+        case 405: return "Method Not Allowed"
+        case 413: return "Payload Too Large"
+        case 429: return "Too Many Requests"
+        case 500: return "Internal Server Error"
+        default:  return "Unknown"
+        }
     }
 }
 #endif
