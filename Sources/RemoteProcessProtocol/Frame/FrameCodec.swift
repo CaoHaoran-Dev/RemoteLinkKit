@@ -75,8 +75,9 @@ public final class FrameCodec: @unchecked Sendable {
         while true {
             let result: FrameDecodeStep = buffer.withUnsafeBytes { raw -> FrameDecodeStep in
                 guard raw.count >= Frame.headerSize else { return .needMore }
+                guard let base = raw.baseAddress else { return .needMore }
 
-                let p = raw.bindMemory(to: UInt8.self).baseAddress!
+                let p = base.assumingMemoryBound(to: UInt8.self)
 
                 let version = p[0]
                 let typeRaw = p[1]

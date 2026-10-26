@@ -132,7 +132,7 @@ let helloResponse = try await client.hello()
 let verifyResponse = try await client.verify(body: proofData)
 ```
 
-`HTTPPairingServer` parses minimal HTTP/1.1 requests and hands them to a handler. It only supports `Content-Length` bodies, not chunked encoding. Requests whose body exceeds `maxBodySize` (1 MB) are rejected with `413` and the connection is closed immediately; malformed request lines get `400`. The parser is exposed as `internal` for unit tests.
+`HTTPPairingServer` parses minimal HTTP/1.1 requests and hands them to a handler. It only supports `Content-Length` bodies, not chunked encoding. Requests whose body exceeds `maxBodySize` (1 MB) are rejected with `413` and the connection is closed immediately. Malformed requests — a bad request line, or a `Content-Length` that is unparsable or negative — get `400`. The parser is exposed as `internal` for unit tests.
 
 ```swift
 let server = HTTPPairingServer { request in
@@ -386,4 +386,3 @@ Those belong to the host application.
 ## License
 
 MIT © 2026 CaoHaoran-Dev
-

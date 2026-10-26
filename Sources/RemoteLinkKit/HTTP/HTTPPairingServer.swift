@@ -146,8 +146,8 @@ public final class HTTPPairingServer: @unchecked Sendable {
 
             case .reject(let status):
                 // 解析层判定请求必须拒绝（如 body 超限），直接回错误并关闭。
-                self.sendResponse(Response(status: status), on: connection) {
-                    self.closeConnection(connection)
+                self.sendResponse(Response(status: status), on: connection) { [weak self] in
+                    self?.closeConnection(connection)
                 }
 
             case .request(let parsed):
@@ -158,8 +158,8 @@ public final class HTTPPairingServer: @unchecked Sendable {
                 }
 
                 let response = self.handler(parsed.request)
-                self.sendResponse(response, on: connection) {
-                    self.closeConnection(connection)
+                self.sendResponse(response, on: connection) { [weak self] in
+                    self?.closeConnection(connection)
                 }
             }
         }
@@ -167,18 +167,19 @@ public final class HTTPPairingServer: @unchecked Sendable {
 
     // MARK: - HTTP Parse
 
-    private enum ParseResult {
+    enum ParseResult {
         case incomplete
         case reject(status: Int)
         case request(ParsedRequest)
     }
 
-    private struct ParsedRequest {
+    struct ParsedRequest {
         let request: Request
         let consumed: Int
     }
 
-    private func tryParseRequest(_ buffer: Data) -> ParseResult {
+    // internal 而非 private，以便 @testable 单元测试覆盖解析边界。
+    func tryParseRequest(_ buffer: Data) -> ParseResult {
         let headerEnd = Data([0x0D, 0x0A, 0x0D, 0x0A])
         guard let headerRange = buffer.range(of: headerEnd) else { return .incomplete }
 
@@ -204,9 +205,13 @@ public final class HTTPPairingServer: @unchecked Sendable {
             headers[key] = value
         }
 
-        let contentLength = Int(headers["content-length"] ?? "0") ?? 0
+        // 拒绝无法解析、负数或超限的 Content-Length。
+        // 负数若不拒绝，后续 bodyStart..<bodyEnd 会构成非法 Range 并崩溃。
+        guard let contentLength = Int(headers["content-length"] ?? "0"),
+              contentLength >= 0 else {
+            return .reject(status: 400)
+        }
 
-        // 请求体超限：直接拒绝，避免连接挂着等一个永远不会被接受的 body。
         guard contentLength <= Self.maxBodySize else {
             return .reject(status: 413)
         }
@@ -223,7 +228,11 @@ public final class HTTPPairingServer: @unchecked Sendable {
 
     // MARK: - Send Response
 
-    private func sendResponse(_ response: Response, on connection: NWConnection, completion: @escaping () -> Void) {
+    /// `completion` 标 `@Sendable`：它会被捕获进 `NWConnection` 的
+    /// `@Sendable` 完成回调，避免严格并发检查告警。
+    private func sendResponse(_ response: Response,
+                              on connection: NWConnection,
+                              completion: @escaping @Sendable () -> Void) {
         var headerLines: [String] = []
         headerLines.append("HTTP/1.1 \(response.status) \(Self.statusText(response.status))")
 

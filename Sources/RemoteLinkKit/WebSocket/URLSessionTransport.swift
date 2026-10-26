@@ -34,6 +34,10 @@ public final class URLSessionTransport: RemoteConnection, @unchecked Sendable {
     /// 发送串行化
     private let sendQueue = DispatchQueue(label: "com.remotelinkkit.send")
 
+    /// 允许的最大连接超时（秒）。`Task.sleep` 的纳秒参数是 `UInt64`，
+    /// 超过约 9.2e9 秒会溢出。这里钳到一个远大于任何合理配置、但不会溢出的值。
+    private static let maxConnectTimeout: TimeInterval = 24 * 60 * 60   // 1 day
+
     // MARK: - Init
 
     public init(config: ConnectionConfig,
@@ -64,14 +68,21 @@ public final class URLSessionTransport: RemoteConnection, @unchecked Sendable {
 
     /// 打开 WebSocket 并等待就绪。
     ///
-    /// 这里**不能**用 `withThrowingTaskGroup` 包 `sendPing`：
-    /// `URLSessionWebSocketTask.sendPing` 的回调没有取消机制，
-    /// 超时任务结束后 ping 回调仍可能触发，导致 continuation 双重 resume（崩溃）。
-    /// 因此用一把锁 + 单次 resume 出口来保证安全。
+    /// 不能用 `withThrowingTaskGroup` 包 `sendPing`：`sendPing` 的回调没有取消机制，
+    /// 超时结束后回调仍可能触发，导致 continuation 双重 resume（崩溃）。
+    /// 这里用一把锁 + 单次 resume 出口保证安全。
     ///
-    /// 超时看门狗用 `Task` 实现而非 `DispatchWorkItem`，避免在
-    /// `@Sendable` 闭包里捕获非 Sendable 的 Dispatch 类型。
+    /// 超时看门狗用 `Task` 实现，并且只捕获 Sendable 值（nanos / resumeOnce / cont），
+    /// 不捕获 `self`，避免严格并发检查告警。
     private func openTask(url: URL) async throws {
+        // 防御非法超时配置：非有限、非正数视为错误；
+        // 过大的值钳到上界，避免 Double -> UInt64 纳秒转换 trap。
+        let rawTimeout = config.connectTimeout
+        guard rawTimeout.isFinite, rawTimeout > 0 else {
+            throw ConnectionError.timeout
+        }
+        let timeout = min(rawTimeout, Self.maxConnectTimeout)
+
         let task = URLSession.shared.webSocketTask(with: url)
 
         lock.withLock { self.task = task }
@@ -79,14 +90,13 @@ public final class URLSessionTransport: RemoteConnection, @unchecked Sendable {
         task.resume()
 
         let resumeOnce = ResumeOnce()
+        let nanos = UInt64(timeout * 1_000_000_000)
 
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             // 超时看门狗
             let timeoutTask = Task {
                 do {
-                    try await Task.sleep(
-                        nanoseconds: UInt64(self.config.connectTimeout * 1_000_000_000)
-                    )
+                    try await Task.sleep(nanoseconds: nanos)
                 } catch {
                     // 被取消：ping 先完成，什么都不做
                     return
@@ -98,7 +108,7 @@ public final class URLSessionTransport: RemoteConnection, @unchecked Sendable {
 
             // 连接就绪探测：发一个 ping
             task.sendPing { error in
-                // 无论成功失败，先取消看门狗，避免超时后再 resume
+                // 先取消看门狗，避免超时后再 resume
                 timeoutTask.cancel()
                 guard resumeOnce.tryResume() else { return }
                 if let error = error {
