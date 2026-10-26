@@ -11,7 +11,8 @@ import Foundation
 ///
 /// - 生成时随机 6 位数字
 /// - 有效期默认 10 分钟
-/// - 失败 5 次锁 1 分钟，10 次作废
+/// - 失败 5 次锁 1 分钟（锁定期间校验直接返回 tooManyAttempts，不累加失败次数）
+/// - 累计失败 10 次作废
 /// - 码本身不裸传，作为 HKDF 输入 + HMAC proof
 public final class PairingCode: @unchecked Sendable {
 
@@ -81,8 +82,12 @@ public final class PairingCode: @unchecked Sendable {
             if let until = _lockedUntil, Date() < until {
                 return .failure(.tooManyAttempts)
             }
+            // 锁已过期：清除锁标记，允许继续尝试
+            if _lockedUntil != nil {
+                _lockedUntil = nil
+            }
 
-            if input == _code {
+            if Self.constantTimeEqual(input, _code) {
                 _consumed = true
                 return .success(())
             } else {
@@ -105,5 +110,18 @@ public final class PairingCode: @unchecked Sendable {
     private static func generateCode() -> String {
         let n = Int.random(in: 0..<1_000_000)
         return String(format: "%06d", n)
+    }
+
+    // MARK: - Constant-time Compare
+
+    private static func constantTimeEqual(_ a: String, _ b: String) -> Bool {
+        let aBytes = Array(a.utf8)
+        let bBytes = Array(b.utf8)
+        guard aBytes.count == bBytes.count else { return false }
+        var diff: UInt8 = 0
+        for i in 0..<aBytes.count {
+            diff |= aBytes[i] ^ bBytes[i]
+        }
+        return diff == 0
     }
 }

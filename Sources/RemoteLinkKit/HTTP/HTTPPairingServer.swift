@@ -38,6 +38,13 @@ public final class HTTPPairingServer: @unchecked Sendable {
 
     public typealias Handler = @Sendable (Request) -> Response
 
+    // MARK: - Limits
+
+    /// 请求头 + 请求体的最大缓冲上限，超过则主动断开。
+    public static let maxBufferSize = 2 * 1024 * 1024   // 2 MB
+    /// 请求体最大长度。
+    public static let maxBodySize = 1024 * 1024          // 1 MB
+
     // MARK: - Private
 
     private let handler: Handler
@@ -56,10 +63,18 @@ public final class HTTPPairingServer: @unchecked Sendable {
     // MARK: - Start / Stop
 
     public func start(port: UInt16) throws {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            throw NSError(
+                domain: "RemoteLinkKit.HTTPPairingServer",
+                code: Int(EINVAL),
+                userInfo: [NSLocalizedDescriptionKey: "Invalid port: \(port)"]
+            )
+        }
+
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
 
-        let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
+        let listener = try NWListener(using: parameters, on: nwPort)
         listener.newConnectionHandler = { [weak self] connection in
             self?.handleNewConnection(connection)
         }
@@ -115,6 +130,12 @@ public final class HTTPPairingServer: @unchecked Sendable {
                 buffer.append(data)
             }
 
+            // 缓冲上限保护，防止慢速/超大请求耗尽内存
+            if buffer.count > Self.maxBufferSize {
+                self.closeConnection(connection)
+                return
+            }
+
             if let parsed = self.tryParseRequest(buffer) {
                 let response = self.handler(parsed.request)
 
@@ -168,6 +189,10 @@ public final class HTTPPairingServer: @unchecked Sendable {
         }
 
         let contentLength = Int(headers["content-length"] ?? "0") ?? 0
+        // 请求体超限：返回 nil（调用方不会继续缓冲，最终由缓冲上限或 isComplete 断开），
+        // 这里直接拒绝更明确。用 413 语义由上层 handler 决定，解析层只拒绝。
+        guard contentLength <= Self.maxBodySize else { return nil }
+
         let bodyStart = headerRange.upperBound
         let bodyEnd = bodyStart + contentLength
 

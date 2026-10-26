@@ -10,28 +10,11 @@ import XCTest
 
 final class HeartbeatControllerTests: XCTestCase {
 
-    // MARK: - Thread-safe boxes
-
-    private final class Box<T>: @unchecked Sendable {
-        private let lock = NSLock()
-        private var _value: T
-        init(_ value: T) { self._value = value }
-        var value: T {
-            get { lock.withLock { _value } }
-            set { lock.withLock { _value = newValue } }
-        }
-    }
-
-    private final class FlagBox: @unchecked Sendable {
+    private final class Flag: @unchecked Sendable {
         private let lock = NSLock()
         private var _value = false
-        func trySet() -> Bool {
-            lock.withLock {
-                if _value { return false }
-                _value = true
-                return true
-            }
-        }
+        func set() { lock.withLock { _value = true } }
+        var value: Bool { lock.withLock { _value } }
     }
 
     private final class Counter: @unchecked Sendable {
@@ -47,8 +30,6 @@ final class HeartbeatControllerTests: XCTestCase {
         }
     }
 
-    // MARK: - Lifecycle
-
     private var activeControllers: [HeartbeatController] = []
 
     override func tearDown() {
@@ -57,104 +38,82 @@ final class HeartbeatControllerTests: XCTestCase {
         super.tearDown()
     }
 
-    private func makeController(interval: TimeInterval,
-                                timeout: TimeInterval) -> HeartbeatController {
+    private func makeController(interval: TimeInterval, timeout: TimeInterval) -> HeartbeatController {
         let hb = HeartbeatController(interval: interval, timeout: timeout)
         activeControllers.append(hb)
         return hb
     }
 
-    // MARK: - Tests
-
     func testPingFires() {
-        let exp = expectation(description: "ping fired")
-        let fired = FlagBox()
-
-        let hb = makeController(interval: 0.2, timeout: 1.0)
-        hb.onSendPing = { [weak hb] in
-            _ = hb
-            if fired.trySet() {
-                DispatchQueue.main.async { exp.fulfill() }
-            }
-        }
+        let fired = Flag()
+        let hb = makeController(interval: 0.1, timeout: 1.0)
+        
+        hb.onSendPing = { fired.set() }
 
         hb.start()
-        wait(for: [exp], timeout: 2.0)
+        Thread.sleep(forTimeInterval: 0.3)
+        
+        XCTAssertTrue(fired.value, "Ping should have fired")
         hb.stop()
     }
 
     func testTimeoutFiresWhenNoPong() {
-        let timeoutExp = expectation(description: "timeout")
-        let fired = FlagBox()
-
+        let fired = Flag()
         let hb = makeController(interval: 0.1, timeout: 0.2)
-        hb.onTimeout = { [weak hb] in
-            _ = hb
-            if fired.trySet() {
-                DispatchQueue.main.async { timeoutExp.fulfill() }
-            }
-        }
+        
+        hb.onSendPing = {}
+        hb.onTimeout = { fired.set() }
 
         hb.start()
-        wait(for: [timeoutExp], timeout: 2.0)
+        // interval(0.1) + timeout(0.2) = 0.3，我们等 0.6 绝对稳
+        Thread.sleep(forTimeInterval: 0.6)
+        
+        XCTAssertTrue(fired.value, "Timeout should have fired because no pong was received")
         hb.stop()
     }
 
     func testPongCancelsTimeout() {
-        let timeoutExp = expectation(description: "timeout should not fire")
-        timeoutExp.isInverted = true
-
-        let hb = makeController(interval: 0.2, timeout: 0.3)
-        hb.onSendPing = { [weak hb] in
-            hb?.receivedPong()
-        }
-        hb.onTimeout = { [weak hb] in
-            _ = hb
-            DispatchQueue.main.async { timeoutExp.fulfill() }
-        }
+        let fired = Flag()
+        let hb = makeController(interval: 0.1, timeout: 0.2)
+        
+        hb.onSendPing = { [weak hb] in hb?.receivedPong() }
+        hb.onTimeout = { fired.set() }
 
         hb.start()
-        wait(for: [timeoutExp], timeout: 1.5)
+        Thread.sleep(forTimeInterval: 0.6)
+        
+        XCTAssertFalse(fired.value, "Timeout should NOT fire because pong was received")
         hb.stop()
     }
 
     func testStopCancelsTimers() {
-        let pingExp = expectation(description: "no ping after stop")
-        pingExp.isInverted = true
-
+        let fired = Flag()
         let hb = makeController(interval: 0.1, timeout: 0.2)
-        hb.onSendPing = { [weak hb] in
-            _ = hb
-            DispatchQueue.main.async { pingExp.fulfill() }
-        }
+        
+        hb.onSendPing = { fired.set() }
+        
         hb.start()
         hb.stop()
-
-        wait(for: [pingExp], timeout: 0.5)
+        
+        Thread.sleep(forTimeInterval: 0.4)
+        
+        XCTAssertFalse(fired.value, "Ping should not fire after stop()")
     }
 
     func testStartIsIdempotent() {
         let counter = Counter()
-        let exp = expectation(description: "ping")
-        exp.assertForOverFulfill = false
-        let fired = FlagBox()
-
-        let hb = makeController(interval: 0.3, timeout: 1.0)
-        hb.onSendPing = { [weak hb] in
-            _ = hb
-            counter.increment()
-            if fired.trySet() {
-                DispatchQueue.main.async { exp.fulfill() }
-            }
-        }
+        let hb = makeController(interval: 0.1, timeout: 1.0)
+        
+        hb.onSendPing = { counter.increment() }
 
         hb.start()
         hb.start()
         hb.start()
 
-        wait(for: [exp], timeout: 2.0)
-        hb.stop()
-
+        Thread.sleep(forTimeInterval: 0.4)
+        
         XCTAssertGreaterThanOrEqual(counter.value, 1)
+        XCTAssertLessThan(counter.value, 10, "Multiple start() calls should not spawn duplicate timers")
+        hb.stop()
     }
 }

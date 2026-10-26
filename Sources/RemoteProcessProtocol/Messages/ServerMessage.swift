@@ -42,7 +42,7 @@ extension ServerMessage: Codable {
         case .output(let id, let stream, let data):
             try c.encode("output", forKey: .type)
             try c.encode(id, forKey: .id)
-            try c.encode(stream.rawValue, forKey: .stream)
+            try c.encode(stream, forKey: .stream)
             try c.encode(data.base64EncodedString(), forKey: .data)
         case .done(let id, let exit, let cwd):
             try c.encode("done", forKey: .type)
@@ -67,10 +67,7 @@ extension ServerMessage: Codable {
         let type = try c.decode(String.self, forKey: .type)
         switch type {
         case "output":
-            let raw = try c.decode(String.self, forKey: .stream)
-            guard let stream = Stream(rawValue: raw) else {
-                throw MessageError.unknownType(raw)
-            }
+            let stream = try c.decode(Stream.self, forKey: .stream)
             let b64 = try c.decode(String.self, forKey: .data)
             self = .output(
                 id: try c.decode(String.self, forKey: .id),

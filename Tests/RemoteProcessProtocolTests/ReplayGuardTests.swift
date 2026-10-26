@@ -42,10 +42,4 @@ final class ReplayGuardTests: XCTestCase {
         g.reset()
         XCTAssertTrue(g.accept(1))
     }
-}//
-//  ReplayGuardTests.swift
-//  RemoteLinkKit
-//
-//  Created by Haoran on 2026/10/25.
-//
-
+}

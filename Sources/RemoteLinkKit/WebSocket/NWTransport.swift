@@ -30,6 +30,7 @@ public final class NWTransport: RemoteConnection, @unchecked Sendable {
     private let lock = NSLock()
     private var _state: ConnectionState = .idle
     private var isClosedByUser = false
+    private var isClosed = false
 
     // MARK: - Init
 
@@ -71,6 +72,10 @@ public final class NWTransport: RemoteConnection, @unchecked Sendable {
     // MARK: - Send
 
     public func send(_ data: Data) async throws {
+        if lock.withLock({ isClosed }) {
+            throw ConnectionError.closed
+        }
+
         let payload = try transform.encode(data)
 
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
@@ -98,7 +103,13 @@ public final class NWTransport: RemoteConnection, @unchecked Sendable {
     // MARK: - Close
 
     public func close() {
-        lock.withLock { isClosedByUser = true }
+        let shouldClose = lock.withLock { () -> Bool in
+            if isClosed { return false }
+            isClosed = true
+            isClosedByUser = true
+            return true
+        }
+        guard shouldClose else { return }
 
         // 发关闭帧
         let metadata = NWProtocolWebSocket.Metadata(opcode: .close)
@@ -121,6 +132,9 @@ public final class NWTransport: RemoteConnection, @unchecked Sendable {
     // MARK: - Receive
 
     private func receiveLoop() {
+        let closed = lock.withLock { isClosed }
+        guard !closed else { return }
+
         connection.receiveMessage { [weak self] data, context, _, error in
             guard let self = self else { return }
 
@@ -128,6 +142,9 @@ public final class NWTransport: RemoteConnection, @unchecked Sendable {
                 self.handleDisconnect(error: error)
                 return
             }
+
+            let closedNow = self.lock.withLock { self.isClosed }
+            if closedNow { return }
 
             if let metadata = context?.protocolMetadata(definition: NWProtocolWebSocket.definition)
                 as? NWProtocolWebSocket.Metadata {
@@ -171,14 +188,15 @@ public final class NWTransport: RemoteConnection, @unchecked Sendable {
     // MARK: - Disconnect
 
     private func handleDisconnect(error: Error) {
-        let closedByUser = lock.withLock { isClosedByUser }
+        let alreadyClosed = lock.withLock { () -> Bool in
+            if isClosed { return true }
+            isClosed = true
+            return false
+        }
         connection.cancel()
 
-        if closedByUser {
-            transition(.closed(reason: error.localizedDescription))
-        } else {
-            transition(.closed(reason: error.localizedDescription))
-        }
+        if alreadyClosed { return }
+        transition(.closed(reason: error.localizedDescription))
     }
 
     // MARK: - State

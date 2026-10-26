@@ -86,8 +86,16 @@ public final class URLSessionTransport: RemoteConnection, @unchecked Sendable {
                 try await Task.sleep(nanoseconds: UInt64(self.config.connectTimeout * 1_000_000_000))
                 throw ConnectionError.timeout
             }
-            try await group.next()
-            group.cancelAll()
+
+            defer { group.cancelAll() }
+
+            do {
+                _ = try await group.next()
+            } catch is CancellationError {
+                // ping 成功后 cancelAll 会让 sleep 任务抛 CancellationError，
+                // 此时连接已建立，视为成功。
+                return
+            }
         }
     }
 
@@ -171,10 +179,19 @@ public final class URLSessionTransport: RemoteConnection, @unchecked Sendable {
     // MARK: - Reconnect
 
     private func handleDisconnect(error: Error) {
-        let closedByUser: Bool = lock.withLock {
+        let (closedByUser, stillHasTask): (Bool, Bool) = lock.withLock {
             let c = isClosedByUser
+            let had = self.task != nil
             self.task = nil
-            return c
+            return (c, had)
+        }
+
+        // 如果 task 已经被置空（close 或重复回调），避免重复处理
+        guard stillHasTask else {
+            if !closedByUser {
+                transition(.closed(reason: error.localizedDescription))
+            }
+            return
         }
 
         guard !closedByUser else {

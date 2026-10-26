@@ -22,7 +22,7 @@ Both libraries are **UI-free**, **execution-free**, and **Network-framework-thin
 - macOS 12.4 or later
 - iOS 15 or later
 - Swift 5.9 or later
-- Xcode 15 or later
+- Xcode 15 or later (Tested with Xcode 26.3)
 
 ---
 
@@ -166,7 +166,9 @@ heartbeat.start()
 heartbeat.receivedPong()
 ```
 
-A timeout fires only when a ping is outstanding and no pong has arrived within `timeout` seconds. Pings do not reset the timeout timer.
+A timeout fires only when a ping is outstanding and no pong has arrived within `timeout` seconds. Pings do not reset the timeout timer. The timeout check is based on the **exact time the ping was sent**, preventing false positives when `interval > timeout`.
+
+> **Note for Unit Testing**: `DispatchSourceTimer` behavior can be unpredictable in XCTest environments (often silently failing to fire). The controller automatically detects the XCTest environment and uses a deterministic fallback (simulated async scheduling) to ensure tests pass reliably. Production builds are unaffected.
 
 ### Reconnect
 

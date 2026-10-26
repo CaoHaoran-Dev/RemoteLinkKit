@@ -43,7 +43,11 @@ public final class FrameCodec: @unchecked Sendable {
         return d
     }
 
-    /// 分配下一个 seq 并编码
+    /// 分配下一个 seq 并编码。
+    ///
+    /// 注意：`SecureChannel` 自行维护 seq 并直接构造 `Frame`，
+    /// 此方法仅供单帧发送或测试使用。不要在同一个连接上与
+    /// `SecureChannel` 混用，否则会导致 seq 冲突。
     public func encodeNext(type: FrameType, payload: Data) -> Data {
         let seq: UInt32 = lock.withLock {
             let s = nextSeq
@@ -56,29 +60,31 @@ public final class FrameCodec: @unchecked Sendable {
 
     // MARK: - Decode
 
-    /// 追加数据到缓冲区，并尝试切出所有完整帧
+    /// 追加数据到缓冲区，并尝试切出所有完整帧。
+    ///
+    /// 整个切帧过程持锁，避免并发 `decode` 之间的缓冲区竞态。
     public func decode(_ data: Data) throws -> [Frame] {
         lock.lock()
+        defer { lock.unlock() }
+
         buffer.append(data)
-        let snapshot = buffer
-        lock.unlock()
 
         var frames: [Frame] = []
         var offset = 0
 
-        while snapshot.count - offset >= Frame.headerSize {
-            let base = snapshot.startIndex + offset
-            let version = snapshot[base]
-            let typeRaw = snapshot[base + 1]
-            let cipherId = (UInt16(snapshot[base + 2]) << 8) | UInt16(snapshot[base + 3])
-            let seq = (UInt32(snapshot[base + 4]) << 24)
-                | (UInt32(snapshot[base + 5]) << 16)
-                | (UInt32(snapshot[base + 6]) << 8)
-                | UInt32(snapshot[base + 7])
-            let length = (Int(snapshot[base + 8]) << 24)
-                | (Int(snapshot[base + 9]) << 16)
-                | (Int(snapshot[base + 10]) << 8)
-                | Int(snapshot[base + 11])
+        while buffer.count - offset >= Frame.headerSize {
+            let base = buffer.startIndex + offset
+            let version = buffer[base]
+            let typeRaw = buffer[base + 1]
+            let cipherId = (UInt16(buffer[base + 2]) << 8) | UInt16(buffer[base + 3])
+            let seq = (UInt32(buffer[base + 4]) << 24)
+                | (UInt32(buffer[base + 5]) << 16)
+                | (UInt32(buffer[base + 6]) << 8)
+                | UInt32(buffer[base + 7])
+            let length = (Int(buffer[base + 8]) << 24)
+                | (Int(buffer[base + 9]) << 16)
+                | (Int(buffer[base + 10]) << 8)
+                | Int(buffer[base + 11])
 
             guard version == Frame.currentVersion else {
                 throw FrameError.invalidVersion(version)
@@ -91,11 +97,11 @@ public final class FrameCodec: @unchecked Sendable {
             }
 
             let total = Frame.headerSize + length
-            guard snapshot.count - offset >= total else { break }
+            guard buffer.count - offset >= total else { break }
 
             let payloadStart = base + Frame.headerSize
             let payloadEnd = payloadStart + length
-            let payload = snapshot[payloadStart..<payloadEnd]
+            let payload = buffer[payloadStart..<payloadEnd]
 
             frames.append(Frame(version: version,
                                 type: type,
@@ -106,9 +112,7 @@ public final class FrameCodec: @unchecked Sendable {
         }
 
         if offset > 0 {
-            lock.lock()
             buffer.removeFirst(offset)
-            lock.unlock()
         }
 
         return frames

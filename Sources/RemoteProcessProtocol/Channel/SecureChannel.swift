@@ -28,6 +28,9 @@ public actor SecureChannel {
     private let isClient: Bool
     private var seqCounter: UInt32 = 0
 
+    /// 串行化发送，保证 seq 分配顺序与实际写出顺序一致。
+    private var sendTail: Task<Void, Never>?
+
     // MARK: - Init
 
     public init(transport: RemoteConnection,
@@ -78,6 +81,7 @@ public actor SecureChannel {
     }
 
     private func sendFrame(type: FrameType, plaintext: Data) async throws {
+        // 在 actor 内完成 seq 分配与加密，然后串行写出。
         let seq = nextSeq()
         let headerAAD = Frame(
             type: type,
@@ -91,7 +95,22 @@ public actor SecureChannel {
 
         let frame = Frame(type: type, cipherId: cipherId, seq: seq, payload: sealed)
         let bytes = codec.encode(frame)
-        try await transport.send(bytes)
+
+        try await enqueueSend(bytes)
+    }
+
+    /// 串行化发送：前一个发送完成后才继续，保证字节写出顺序与 seq 顺序一致。
+    private func enqueueSend(_ bytes: Data) async throws {
+        let previous = sendTail
+        let transport = self.transport
+
+        let task = Task<Void, Error> {
+            _ = await previous?.result
+            try await transport.send(bytes)
+        }
+        sendTail = Task { _ = try? await task.value }
+
+        try await task.value
     }
 
     private func nextSeq() -> UInt32 {
@@ -123,9 +142,15 @@ public actor SecureChannel {
 
         if isClient {
             let msg = try MessageCodec.decodeServer(plaintext)
+            guard msg.frameType == frame.type else {
+                throw MessageError.mismatchedFrameType(expected: msg.frameType, actual: frame.type)
+            }
             _onServerMessage?(msg)
         } else {
             let msg = try MessageCodec.decodeClient(plaintext)
+            guard msg.frameType == frame.type else {
+                throw MessageError.mismatchedFrameType(expected: msg.frameType, actual: frame.type)
+            }
             _onClientMessage?(msg)
         }
     }

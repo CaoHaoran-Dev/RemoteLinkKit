@@ -93,15 +93,81 @@ public final class BonjourBrowser: @unchecked Sendable {
         browser?.cancel()
     }
 
-    // MARK: - Endpoint Helpers
+    // MARK: - Endpoint Resolution
 
-    /// 从 NWEndpoint 提取 host 和 port
-    /// 注意：NWEndpoint 不直接给 host/port，实际地址由使用方建立 NWConnection 时解析。
-    public static func resolve(_ endpoint: NWEndpoint) -> (host: String, port: Int)? {
+    /// 解析 Bonjour endpoint 为 host + port。
+    ///
+    /// `NWEndpoint` 不直接暴露 host/port，需要建立 `NWConnection` 后读取
+    /// `currentPath?.remoteEndpoint`。连接会立即取消，仅用于解析。
+    public static func resolve(_ endpoint: NWEndpoint,
+                               timeout: TimeInterval = 5) async throws -> (host: String, port: Int) {
         guard case .service = endpoint else {
-            return nil
+            throw NWError.posix(.EINVAL)
         }
-        return nil
+
+        let params = NWParameters.tcp
+        params.includePeerToPeer = true
+        let connection = NWConnection(to: endpoint, using: params)
+
+        return try await withThrowingTaskGroup(of: (String, Int).self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(String, Int), Error>) in
+                    let resumed = LockedFlag()
+
+                    connection.stateUpdateHandler = { state in
+                        switch state {
+                        case .ready:
+                            guard let remote = connection.currentPath?.remoteEndpoint else {
+                                if resumed.trySet() {
+                                    cont.resume(throwing: NWError.posix(.EADDRNOTAVAIL))
+                                }
+                                connection.cancel()
+                                return
+                            }
+                            if case .hostPort(let host, let port) = remote {
+                                if resumed.trySet() {
+                                    cont.resume(returning: ("\(host)", Int(port.rawValue)))
+                                }
+                            } else {
+                                if resumed.trySet() {
+                                    cont.resume(throwing: NWError.posix(.EADDRNOTAVAIL))
+                                }
+                            }
+                            connection.cancel()
+                        case .failed(let error):
+                            if resumed.trySet() { cont.resume(throwing: error) }
+                            connection.cancel()
+                        case .cancelled:
+                            if resumed.trySet() { cont.resume(throwing: NWError.posix(.ECANCELED)) }
+                        default:
+                            break
+                        }
+                    }
+                    connection.start(queue: .global())
+                }
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw NWError.posix(.ETIMEDOUT)
+            }
+
+            defer { group.cancelAll() }
+            let result = try await group.next()!
+            return result
+        }
+    }
+
+    /// 简单的一次性标志，避免 continuation 被 resume 两次。
+    private final class LockedFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        func trySet() -> Bool {
+            lock.withLock {
+                if value { return false }
+                value = true
+                return true
+            }
+        }
     }
 }
 #endif
