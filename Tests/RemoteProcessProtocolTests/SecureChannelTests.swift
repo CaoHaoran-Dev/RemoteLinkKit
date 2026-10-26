@@ -27,6 +27,34 @@ final class SecureChannelTests: XCTestCase {
         func close() {}
     }
 
+    // MARK: - Failing transport
+
+    private final class FailingAfterOneSendTransport: RemoteConnection, @unchecked Sendable {
+        var state: ConnectionState = .connected
+        var onStateChange: (@Sendable (ConnectionState) -> Void)?
+        var onReceive: (@Sendable (Data) -> Void)?
+
+        private let lock = NSLock()
+        private var sendCount = 0
+        private let failOn: Int
+
+        init(failOn: Int) { self.failOn = failOn }
+
+        func connect() async throws {}
+        func send(_ data: Data) async throws {
+            let n: Int = lock.withLock {
+                sendCount += 1
+                return sendCount
+            }
+            if n == failOn {
+                throw ConnectionError.sendFailed(
+                    underlying: NSError(domain: "test", code: 1)
+                )
+            }
+        }
+        func close() {}
+    }
+
     // MARK: - Tests
 
     func testClientToServerExec() async throws {
@@ -196,5 +224,39 @@ final class SecureChannelTests: XCTestCase {
 
         try await client.send(.ping(timestamp: Date()))
         await fulfillment(of: [errExp], timeout: 2.0)
+    }
+
+    // MARK: - Send Failure Stickiness
+
+    /// 回归保护：一次发送失败后，channel 应进入粘滞失败态，
+    /// 后续发送直接抛错，不再消耗 seq / 尝试 transport。
+    func testSendFailureSticksAndBlocksSubsequentSends() async throws {
+        let key = Data(repeating: 0x55, count: 32)
+        let cipher = try AESGCMCipher(key: key)
+        let transport = FailingAfterOneSendTransport(failOn: 2)
+
+        let channel = SecureChannel(transport: transport,
+                                    cipher: cipher,
+                                    cipherId: AESGCMCipher.cipherId,
+                                    isClient: true)
+
+        // 第一次发送成功
+        try await channel.send(.ping(timestamp: Date()))
+
+        // 第二次发送失败
+        do {
+            try await channel.send(.cancel(id: "x"))
+            XCTFail("second send should throw")
+        } catch {
+            // expected
+        }
+
+        // 第三次发送应直接失败，不再尝试 transport
+        do {
+            try await channel.send(.cancel(id: "y"))
+            XCTFail("third send should throw")
+        } catch {
+            // expected
+        }
     }
 }

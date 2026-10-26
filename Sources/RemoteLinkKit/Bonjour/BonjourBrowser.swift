@@ -151,7 +151,11 @@ public final class BonjourBrowser: @unchecked Sendable {
                 throw NWError.posix(.ETIMEDOUT)
             }
 
-            defer { group.cancelAll() }
+            defer {
+                // 无论成功、超时还是取消，都保证连接被释放，避免 NWConnection 泄漏。
+                connection.cancel()
+                group.cancelAll()
+            }
             let result = try await group.next()!
             return result
         }

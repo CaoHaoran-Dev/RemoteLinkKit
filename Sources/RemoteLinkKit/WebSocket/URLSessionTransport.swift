@@ -62,6 +62,15 @@ public final class URLSessionTransport: RemoteConnection, @unchecked Sendable {
         receiveLoop()
     }
 
+    /// 打开 WebSocket 并等待就绪。
+    ///
+    /// 这里**不能**用 `withThrowingTaskGroup` 包 `sendPing`：
+    /// `URLSessionWebSocketTask.sendPing` 的回调没有取消机制，
+    /// 超时任务结束后 ping 回调仍可能触发，导致 continuation 双重 resume（崩溃）。
+    /// 因此用一把锁 + 单次 resume 出口来保证安全。
+    ///
+    /// 超时看门狗用 `Task` 实现而非 `DispatchWorkItem`，避免在
+    /// `@Sendable` 闭包里捕获非 Sendable 的 Dispatch 类型。
     private func openTask(url: URL) async throws {
         let task = URLSession.shared.webSocketTask(with: url)
 
@@ -69,32 +78,34 @@ public final class URLSessionTransport: RemoteConnection, @unchecked Sendable {
 
         task.resume()
 
-        // 连接超时：发一个 ping 等 pong
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                    task.sendPing { error in
-                        if let error = error {
-                            cont.resume(throwing: error)
-                        } else {
-                            cont.resume()
-                        }
-                    }
+        let resumeOnce = ResumeOnce()
+
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            // 超时看门狗
+            let timeoutTask = Task {
+                do {
+                    try await Task.sleep(
+                        nanoseconds: UInt64(self.config.connectTimeout * 1_000_000_000)
+                    )
+                } catch {
+                    // 被取消：ping 先完成，什么都不做
+                    return
+                }
+                if resumeOnce.tryResume() {
+                    cont.resume(throwing: ConnectionError.timeout)
                 }
             }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(self.config.connectTimeout * 1_000_000_000))
-                throw ConnectionError.timeout
-            }
 
-            defer { group.cancelAll() }
-
-            do {
-                _ = try await group.next()
-            } catch is CancellationError {
-                // ping 成功后 cancelAll 会让 sleep 任务抛 CancellationError，
-                // 此时连接已建立，视为成功。
-                return
+            // 连接就绪探测：发一个 ping
+            task.sendPing { error in
+                // 无论成功失败，先取消看门狗，避免超时后再 resume
+                timeoutTask.cancel()
+                guard resumeOnce.tryResume() else { return }
+                if let error = error {
+                    cont.resume(throwing: error)
+                } else {
+                    cont.resume()
+                }
             }
         }
     }
@@ -245,5 +256,23 @@ public final class URLSessionTransport: RemoteConnection, @unchecked Sendable {
             return onStateChange
         }
         handler?(newState)
+    }
+}
+
+// MARK: - ResumeOnce
+
+/// 单次 resume 保护：并发环境下只有一个调用方能把 continuation resume 掉。
+/// 用于 `sendPing` 回调与超时看门狗之间的竞速。
+private final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+
+    /// 返回 true 表示本次调用赢得了 resume 权。
+    func tryResume() -> Bool {
+        lock.withLock {
+            if done { return false }
+            done = true
+            return true
+        }
     }
 }

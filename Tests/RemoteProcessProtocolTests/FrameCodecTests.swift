@@ -69,4 +69,24 @@ final class FrameCodecTests: XCTestCase {
         XCTAssertEqual(fa.seq, 0)
         XCTAssertEqual(fb.seq, 1)
     }
+
+    // MARK: - Slice / StartIndex Robustness
+
+    /// 回归保护：`decode` 不应依赖 `Data.startIndex == 0`。
+    /// 用带前缀垃圾的切片构造非零 startIndex 输入。
+    func testDecodeFromNonZeroStartIndexSlice() throws {
+        let codec = FrameCodec(cipherId: 1)
+        let payload = Data("slice".utf8)
+        let frame = Frame(type: .exec, cipherId: 1, seq: 3, payload: payload)
+        let encoded = codec.encode(frame)
+
+        var padded = Data([0xFF, 0xEE, 0xDD])
+        padded.append(encoded)
+        let slice = padded.suffix(from: 3)   // 非零 startIndex 的 SubSequence
+
+        let frames = try codec.decode(slice)
+        XCTAssertEqual(frames.count, 1)
+        XCTAssertEqual(frames[0].payload, payload)
+        XCTAssertEqual(frames[0].seq, 3)
+    }
 }

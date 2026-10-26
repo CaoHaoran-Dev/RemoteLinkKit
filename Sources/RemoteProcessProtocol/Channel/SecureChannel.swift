@@ -31,6 +31,10 @@ public actor SecureChannel {
     /// 串行化发送，保证 seq 分配顺序与实际写出顺序一致。
     private var sendTail: Task<Void, Never>?
 
+    /// 发送链上出现过的错误。一旦设置，后续发送直接失败，
+    /// 避免"某个 seq 的帧没发出去、后续帧继续发"造成状态不一致。
+    private var sendFailure: Error?
+
     // MARK: - Init
 
     public init(transport: RemoteConnection,
@@ -81,7 +85,11 @@ public actor SecureChannel {
     }
 
     private func sendFrame(type: FrameType, plaintext: Data) async throws {
-        // 在 actor 内完成 seq 分配与加密，然后串行写出。
+        // 发送链已损坏，直接失败，不再消耗 seq。
+        if let failure = sendFailure {
+            throw failure
+        }
+
         let seq = nextSeq()
         let headerAAD = Frame(
             type: type,
@@ -96,7 +104,15 @@ public actor SecureChannel {
         let frame = Frame(type: type, cipherId: cipherId, seq: seq, payload: sealed)
         let bytes = codec.encode(frame)
 
-        try await enqueueSend(bytes)
+        do {
+            try await enqueueSend(bytes)
+        } catch {
+            // 记录首次失败；后续发送都会抛这个错误。
+            if sendFailure == nil {
+                sendFailure = error
+            }
+            throw error
+        }
     }
 
     /// 串行化发送：前一个发送完成后才继续，保证字节写出顺序与 seq 顺序一致。
@@ -105,6 +121,8 @@ public actor SecureChannel {
         let transport = self.transport
 
         let task = Task<Void, Error> {
+            // 等待前一个发送完成；前一个失败也已记录在 sendFailure，
+            // 这里不再重复抛，只保证顺序。
             _ = await previous?.result
             try await transport.send(bytes)
         }

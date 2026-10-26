@@ -111,18 +111,21 @@ public final class NWTransport: RemoteConnection, @unchecked Sendable {
         }
         guard shouldClose else { return }
 
-        // 发关闭帧
+        // 发关闭帧。用局部 connection 强捕获，避免 transport 先释放导致
+        // cancel 不执行、NWConnection 泄漏。
+        let conn = self.connection
+
         let metadata = NWProtocolWebSocket.Metadata(opcode: .close)
         let context = NWConnection.ContentContext(
             identifier: "ws.close",
             metadata: [metadata]
         )
-        connection.send(
+        conn.send(
             content: nil,
             contentContext: context,
             isComplete: true,
-            completion: .contentProcessed { [weak self] _ in
-                self?.connection.cancel()
+            completion: .contentProcessed { _ in
+                conn.cancel()
             }
         )
 

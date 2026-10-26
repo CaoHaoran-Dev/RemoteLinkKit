@@ -130,52 +130,68 @@ public final class HTTPPairingServer: @unchecked Sendable {
                 buffer.append(data)
             }
 
-            // 缓冲上限保护，防止慢速/超大请求耗尽内存
+            // 兜底缓冲上限，防止慢速/超大请求耗尽内存
             if buffer.count > Self.maxBufferSize {
                 self.closeConnection(connection)
                 return
             }
 
-            if let parsed = self.tryParseRequest(buffer) {
-                let response = self.handler(parsed.request)
+            switch self.tryParseRequest(buffer) {
+            case .incomplete:
+                if isComplete {
+                    self.closeConnection(connection)
+                } else {
+                    self.receive(on: connection, buffer: buffer)
+                }
 
+            case .reject(let status):
+                // 解析层判定请求必须拒绝（如 body 超限），直接回错误并关闭。
+                self.sendResponse(Response(status: status), on: connection) {
+                    self.closeConnection(connection)
+                }
+
+            case .request(let parsed):
                 // WebSocket 升级不在这里处理，直接断
-                // （WebSocket 由独立 listener + NWProtocolWebSocket 处理）
                 if parsed.request.headers["upgrade"]?.lowercased() == "websocket" {
                     self.closeConnection(connection)
                     return
                 }
 
+                let response = self.handler(parsed.request)
                 self.sendResponse(response, on: connection) {
                     self.closeConnection(connection)
                 }
-            } else if isComplete {
-                self.closeConnection(connection)
-            } else {
-                self.receive(on: connection, buffer: buffer)
             }
         }
     }
 
     // MARK: - HTTP Parse
 
+    private enum ParseResult {
+        case incomplete
+        case reject(status: Int)
+        case request(ParsedRequest)
+    }
+
     private struct ParsedRequest {
         let request: Request
         let consumed: Int
     }
 
-    private func tryParseRequest(_ buffer: Data) -> ParsedRequest? {
+    private func tryParseRequest(_ buffer: Data) -> ParseResult {
         let headerEnd = Data([0x0D, 0x0A, 0x0D, 0x0A])
-        guard let headerRange = buffer.range(of: headerEnd) else { return nil }
+        guard let headerRange = buffer.range(of: headerEnd) else { return .incomplete }
 
         let headerData = buffer[..<headerRange.lowerBound]
-        guard let headerString = String(data: headerData, encoding: .utf8) else { return nil }
+        guard let headerString = String(data: headerData, encoding: .utf8) else {
+            return .reject(status: 400)
+        }
 
         let lines = headerString.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else { return nil }
+        guard let requestLine = lines.first else { return .incomplete }
 
         let parts = requestLine.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
-        guard parts.count >= 2 else { return nil }
+        guard parts.count >= 2 else { return .reject(status: 400) }
 
         let method = String(parts[0]).uppercased()
         let path = String(parts[1])
@@ -189,18 +205,20 @@ public final class HTTPPairingServer: @unchecked Sendable {
         }
 
         let contentLength = Int(headers["content-length"] ?? "0") ?? 0
-        // 请求体超限：返回 nil（调用方不会继续缓冲，最终由缓冲上限或 isComplete 断开），
-        // 这里直接拒绝更明确。用 413 语义由上层 handler 决定，解析层只拒绝。
-        guard contentLength <= Self.maxBodySize else { return nil }
+
+        // 请求体超限：直接拒绝，避免连接挂着等一个永远不会被接受的 body。
+        guard contentLength <= Self.maxBodySize else {
+            return .reject(status: 413)
+        }
 
         let bodyStart = headerRange.upperBound
         let bodyEnd = bodyStart + contentLength
 
-        guard buffer.count >= bodyEnd else { return nil }
+        guard buffer.count >= bodyEnd else { return .incomplete }
 
         let body = buffer[bodyStart..<bodyEnd]
         let request = Request(method: method, path: path, headers: headers, body: Data(body))
-        return ParsedRequest(request: request, consumed: bodyEnd)
+        return .request(ParsedRequest(request: request, consumed: bodyEnd))
     }
 
     // MARK: - Send Response

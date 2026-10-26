@@ -63,6 +63,7 @@ public final class FrameCodec: @unchecked Sendable {
     /// 追加数据到缓冲区，并尝试切出所有完整帧。
     ///
     /// 整个切帧过程持锁，避免并发 `decode` 之间的缓冲区竞态。
+    /// 使用 `withUnsafeBytes` 做显式偏移读取，不依赖 `Data.startIndex` 的取值。
     public func decode(_ data: Data) throws -> [Frame] {
         lock.lock()
         defer { lock.unlock() }
@@ -70,56 +71,69 @@ public final class FrameCodec: @unchecked Sendable {
         buffer.append(data)
 
         var frames: [Frame] = []
-        var offset = 0
 
-        while buffer.count - offset >= Frame.headerSize {
-            let base = buffer.startIndex + offset
-            let version = buffer[base]
-            let typeRaw = buffer[base + 1]
-            let cipherId = (UInt16(buffer[base + 2]) << 8) | UInt16(buffer[base + 3])
-            let seq = (UInt32(buffer[base + 4]) << 24)
-                | (UInt32(buffer[base + 5]) << 16)
-                | (UInt32(buffer[base + 6]) << 8)
-                | UInt32(buffer[base + 7])
-            let length = (Int(buffer[base + 8]) << 24)
-                | (Int(buffer[base + 9]) << 16)
-                | (Int(buffer[base + 10]) << 8)
-                | Int(buffer[base + 11])
+        while true {
+            let result: FrameDecodeStep = buffer.withUnsafeBytes { raw -> FrameDecodeStep in
+                guard raw.count >= Frame.headerSize else { return .needMore }
 
-            guard version == Frame.currentVersion else {
-                throw FrameError.invalidVersion(version)
+                let p = raw.bindMemory(to: UInt8.self).baseAddress!
+
+                let version = p[0]
+                let typeRaw = p[1]
+                let cipherId = (UInt16(p[2]) << 8) | UInt16(p[3])
+                let seq = (UInt32(p[4]) << 24)
+                    | (UInt32(p[5]) << 16)
+                    | (UInt32(p[6]) << 8)
+                    | UInt32(p[7])
+                let length = (Int(p[8]) << 24)
+                    | (Int(p[9]) << 16)
+                    | (Int(p[10]) << 8)
+                    | Int(p[11])
+
+                if version != Frame.currentVersion {
+                    return .error(.invalidVersion(version))
+                }
+                guard let type = FrameType(rawValue: typeRaw) else {
+                    return .error(.invalidType(typeRaw))
+                }
+                if length > Frame.maxPayloadSize {
+                    return .error(.payloadTooLarge(length))
+                }
+
+                let total = Frame.headerSize + length
+                if raw.count < total { return .needMore }
+
+                let payload = Data(bytes: p + Frame.headerSize, count: length)
+                return .frame(Frame(version: version,
+                                    type: type,
+                                    cipherId: cipherId,
+                                    seq: seq,
+                                    payload: payload),
+                              consumed: total)
             }
-            guard let type = FrameType(rawValue: typeRaw) else {
-                throw FrameError.invalidType(typeRaw)
+
+            switch result {
+            case .needMore:
+                return frames
+            case .error(let error):
+                throw error
+            case .frame(let frame, let consumedBytes):
+                frames.append(frame)
+                buffer.removeFirst(consumedBytes)
             }
-            guard length <= Frame.maxPayloadSize else {
-                throw FrameError.payloadTooLarge(length)
-            }
-
-            let total = Frame.headerSize + length
-            guard buffer.count - offset >= total else { break }
-
-            let payloadStart = base + Frame.headerSize
-            let payloadEnd = payloadStart + length
-            let payload = buffer[payloadStart..<payloadEnd]
-
-            frames.append(Frame(version: version,
-                                type: type,
-                                cipherId: cipherId,
-                                seq: seq,
-                                payload: Data(payload)))
-            offset += total
         }
-
-        if offset > 0 {
-            buffer.removeFirst(offset)
-        }
-
-        return frames
     }
 
     /// 清空缓冲区
     public func reset() {
         lock.withLock { buffer.removeAll() }
+    }
+
+    // MARK: - Decode Step
+
+    private enum FrameDecodeStep {
+        case needMore
+        case error(FrameError)
+        case frame(Frame, consumed: Int)
     }
 }

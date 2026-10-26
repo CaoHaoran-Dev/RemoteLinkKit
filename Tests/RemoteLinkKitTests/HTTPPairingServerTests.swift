@@ -1,95 +1,198 @@
 //
-//  HTTPPairingServerTests.swift
-//  RemoteLinkKitTests
+//  HTTPPairingServer.swift
+//  RemoteLinkKit
 //
 //  Created by Haoran on 2026/10/25.
 //
 
-import XCTest
-@testable import RemoteLinkKit
-
+import Foundation
 #if canImport(Network)
 import Network
 
-final class HTTPPairingServerTests: XCTestCase {
+/// 最小 HTTP/1.1 解析，挂到 NWListener 上，把请求转成回调。
+/// 只支持 Content-Length，不支持 chunked。
+public final class HTTPPairingServer: @unchecked Sendable {
 
-    // MARK: - Parse Tests
+    // MARK: - Request / Response
 
-    func testParseSimpleGET() {
-        let raw = "GET /pair/hello HTTP/1.1\r\nHost: localhost\r\n\r\n"
-        let data = Data(raw.utf8)
-        let parsed = parse(data)
-
-        XCTAssertNotNil(parsed)
-        XCTAssertEqual(parsed?.request.method, "GET")
-        XCTAssertEqual(parsed?.request.path, "/pair/hello")
-        XCTAssertEqual(parsed?.request.headers["host"], "localhost")
-        XCTAssertEqual(parsed?.request.body, Data())
+    public struct Request: Sendable {
+        public let method: String
+        public let path: String
+        public let headers: [String: String]
+        public let body: Data
     }
 
-    func testParsePOSTWithBody() {
-        let body = Data("{\"proof\":\"abc\"}".utf8)
-        var raw = "POST /pair/verify HTTP/1.1\r\n"
-        raw += "Host: localhost\r\n"
-        raw += "Content-Length: \(body.count)\r\n"
-        raw += "\r\n"
+    public struct Response: Sendable {
+        public let status: Int
+        public let headers: [String: String]
+        public let body: Data
 
-        var data = Data(raw.utf8)
-        data.append(body)
-
-        let parsed = parse(data)
-        XCTAssertNotNil(parsed)
-        XCTAssertEqual(parsed?.request.method, "POST")
-        XCTAssertEqual(parsed?.request.path, "/pair/verify")
-        XCTAssertEqual(parsed?.request.body, body)
+        public init(status: Int,
+                    headers: [String: String] = ["Content-Type": "application/json"],
+                    body: Data = Data()) {
+            self.status = status
+            self.headers = headers
+            self.body = body
+        }
     }
 
-    func testParseIncompleteReturnsNil() {
-        let raw = "GET /pair/hello HTTP/1.1\r\nHost: local"
-        XCTAssertNil(parse(Data(raw.utf8)))
+    public typealias Handler = @Sendable (Request) -> Response
+
+    // MARK: - Limits
+
+    /// 请求头 + 请求体的最大缓冲上限，超过则主动断开。
+    public static let maxBufferSize = 2 * 1024 * 1024   // 2 MB
+    /// 请求体最大长度。
+    public static let maxBodySize = 1024 * 1024          // 1 MB
+
+    // MARK: - Private
+
+    private let handler: Handler
+    private let queue = DispatchQueue(label: "com.remotelinkkit.httpserver")
+
+    private let lock = NSLock()
+    private var listener: NWListener?
+    private var connections: [ObjectIdentifier: NWConnection] = [:]
+
+    // MARK: - Init
+
+    public init(handler: @escaping Handler) {
+        self.handler = handler
     }
 
-    func testParseIncompleteBodyReturnsNil() {
-        var raw = "POST /pair/verify HTTP/1.1\r\n"
-        raw += "Content-Length: 10\r\n\r\n"
-        raw += "abc"  // 只有 3 字节
+    // MARK: - Start / Stop
 
-        XCTAssertNil(parse(Data(raw.utf8)))
+    public func start(port: UInt16) throws {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            throw NSError(
+                domain: "RemoteLinkKit.HTTPPairingServer",
+                code: Int(EINVAL),
+                userInfo: [NSLocalizedDescriptionKey: "Invalid port: \(port)"]
+            )
+        }
+
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+
+        let listener = try NWListener(using: parameters, on: nwPort)
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.handleNewConnection(connection)
+        }
+        listener.start(queue: queue)
+
+        lock.withLock { self.listener = listener }
     }
 
-    func testParseHeaderCaseInsensitive() {
-        let raw = "GET /x HTTP/1.1\r\nContent-Length: 0\r\nX-Custom: yes\r\n\r\n"
-        let parsed = parse(Data(raw.utf8))
-        XCTAssertEqual(parsed?.request.headers["x-custom"], "yes")
+    public func stop() {
+        let (l, conns): (NWListener?, [NWConnection]) = lock.withLock {
+            let l = listener
+            let c = Array(connections.values)
+            listener = nil
+            connections.removeAll()
+            return (l, c)
+        }
+
+        l?.cancel()
+        conns.forEach { $0.cancel() }
     }
 
-    // MARK: - Helper
-    //
-    // 这里我们不启动真实 NWListener，只测解析逻辑。
-    // tryParseRequest 是 private，所以通过一个最小的公开访问路径：
-    // 通过真实 listener 端到端测（见 HTTPPairingServerE2ETests）。
-    // 这里用一个反射式的包装——把解析逻辑抄成纯函数测试。
-    //
-    // 注意：如果后续把 tryParseRequest 改为 internal，可以直接测。
+    // MARK: - Connection
 
-    private struct Parsed {
-        let request: HTTPPairingServer.Request
+    private func handleNewConnection(_ connection: NWConnection) {
+        lock.withLock { connections[ObjectIdentifier(connection)] = connection }
+
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled:
+                self?.lock.withLock {
+                    _ = self?.connections.removeValue(forKey: ObjectIdentifier(connection))
+                }
+            default:
+                break
+            }
+        }
+
+        connection.start(queue: queue)
+        receive(on: connection, buffer: Data())
+    }
+
+    private func receive(on connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self = self else { return }
+
+            if error != nil {
+                self.closeConnection(connection)
+                return
+            }
+
+            var buffer = buffer
+            if let data = data {
+                buffer.append(data)
+            }
+
+            // 兜底缓冲上限，防止慢速/超大请求耗尽内存
+            if buffer.count > Self.maxBufferSize {
+                self.closeConnection(connection)
+                return
+            }
+
+            switch self.tryParseRequest(buffer) {
+            case .incomplete:
+                if isComplete {
+                    self.closeConnection(connection)
+                } else {
+                    self.receive(on: connection, buffer: buffer)
+                }
+
+            case .reject(let status):
+                // 解析层判定请求必须拒绝（如 body 超限），直接回错误并关闭。
+                self.sendResponse(Response(status: status), on: connection) {
+                    self.closeConnection(connection)
+                }
+
+            case .request(let parsed):
+                // WebSocket 升级不在这里处理，直接断
+                if parsed.request.headers["upgrade"]?.lowercased() == "websocket" {
+                    self.closeConnection(connection)
+                    return
+                }
+
+                let response = self.handler(parsed.request)
+                self.sendResponse(response, on: connection) {
+                    self.closeConnection(connection)
+                }
+            }
+        }
+    }
+
+    // MARK: - HTTP Parse
+
+    enum ParseResult {
+        case incomplete
+        case reject(status: Int)
+        case request(ParsedRequest)
+    }
+
+    struct ParsedRequest {
+        let request: Request
         let consumed: Int
     }
 
-    private func parse(_ data: Data) -> Parsed? {
-        // 和 HTTPPairingServer.tryParseRequest 完全相同的逻辑
+    // internal 而非 private，以便 @testable 单元测试覆盖解析边界。
+    func tryParseRequest(_ buffer: Data) -> ParseResult {
         let headerEnd = Data([0x0D, 0x0A, 0x0D, 0x0A])
-        guard let headerRange = data.range(of: headerEnd) else { return nil }
+        guard let headerRange = buffer.range(of: headerEnd) else { return .incomplete }
 
-        let headerData = data[..<headerRange.lowerBound]
-        guard let headerString = String(data: headerData, encoding: .utf8) else { return nil }
+        let headerData = buffer[..<headerRange.lowerBound]
+        guard let headerString = String(data: headerData, encoding: .utf8) else {
+            return .reject(status: 400)
+        }
 
         let lines = headerString.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else { return nil }
+        guard let requestLine = lines.first else { return .incomplete }
 
         let parts = requestLine.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
-        guard parts.count >= 2 else { return nil }
+        guard parts.count >= 2 else { return .reject(status: 400) }
 
         let method = String(parts[0]).uppercased()
         let path = String(parts[1])
@@ -103,15 +206,71 @@ final class HTTPPairingServerTests: XCTestCase {
         }
 
         let contentLength = Int(headers["content-length"] ?? "0") ?? 0
+
+        // 请求体超限：直接拒绝，避免连接挂着等一个永远不会被接受的 body。
+        guard contentLength <= Self.maxBodySize else {
+            return .reject(status: 413)
+        }
+
         let bodyStart = headerRange.upperBound
         let bodyEnd = bodyStart + contentLength
-        guard data.count >= bodyEnd else { return nil }
 
-        let body = data[bodyStart..<bodyEnd]
-        let req = HTTPPairingServer.Request(
-            method: method, path: path, headers: headers, body: Data(body)
+        guard buffer.count >= bodyEnd else { return .incomplete }
+
+        let body = buffer[bodyStart..<bodyEnd]
+        let request = Request(method: method, path: path, headers: headers, body: Data(body))
+        return .request(ParsedRequest(request: request, consumed: bodyEnd))
+    }
+
+    // MARK: - Send Response
+
+    private func sendResponse(_ response: Response, on connection: NWConnection, completion: @escaping () -> Void) {
+        var headerLines: [String] = []
+        headerLines.append("HTTP/1.1 \(response.status) \(Self.statusText(response.status))")
+
+        var headers = response.headers
+        headers["Content-Length"] = "\(response.body.count)"
+        headers["Connection"] = "close"
+
+        for (key, value) in headers {
+            headerLines.append("\(key): \(value)")
+        }
+        headerLines.append("")
+        headerLines.append("")
+
+        var data = Data(headerLines.joined(separator: "\r\n").utf8)
+        data.append(response.body)
+
+        connection.send(
+            content: data,
+            completion: .contentProcessed { _ in
+                completion()
+            }
         )
-        return Parsed(request: req, consumed: bodyEnd)
+    }
+
+    private func closeConnection(_ connection: NWConnection) {
+        connection.cancel()
+        lock.withLock {
+            _ = connections.removeValue(forKey: ObjectIdentifier(connection))
+        }
+    }
+
+    // MARK: - Status Text
+
+    private static func statusText(_ code: Int) -> String {
+        switch code {
+        case 200: return "OK"
+        case 400: return "Bad Request"
+        case 401: return "Unauthorized"
+        case 403: return "Forbidden"
+        case 404: return "Not Found"
+        case 405: return "Method Not Allowed"
+        case 413: return "Payload Too Large"
+        case 429: return "Too Many Requests"
+        case 500: return "Internal Server Error"
+        default:  return "Unknown"
+        }
     }
 }
 #endif

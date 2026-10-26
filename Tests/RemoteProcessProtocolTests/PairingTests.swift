@@ -40,6 +40,50 @@ final class PairingTests: XCTestCase {
         XCTAssertTrue(pc.isLocked)
     }
 
+    /// 新增：锁定过期后应清除锁标记，允许继续尝试，且正确码仍可成功。
+    func testLockExpiresAndAllowsRetry() throws {
+        let pc = PairingCode(validity: 600, lockDuration: 0.1)
+        let wrong = pc.code == "000000" ? "000001" : "000000"
+
+        for _ in 0..<PairingCode.maxAttemptsBeforeLock {
+            _ = try? pc.verify(wrong)
+        }
+        XCTAssertTrue(pc.isLocked)
+
+        Thread.sleep(forTimeInterval: 0.2)
+        XCTAssertFalse(pc.isLocked)
+
+        let correct = pc.code
+        XCTAssertNoThrow(try pc.verify(correct))
+        XCTAssertTrue(pc.isConsumed)
+    }
+
+    /// 新增：累计失败达到作废阈值后，码被标记 consumed，正确码也不再可用。
+    func testInvalidateAfterMaxFailures() throws {
+        // 用极短 lockDuration，避免每次锁定阻塞后续失败累加。
+        let pc = PairingCode(validity: 600, lockDuration: 0.01)
+        let wrong = pc.code == "000000" ? "000001" : "000000"
+
+        var totalFailures = 0
+        while totalFailures < PairingCode.maxAttemptsBeforeInvalidate {
+            do {
+                try pc.verify(wrong)
+            } catch PairingError.tooManyAttempts {
+                // 锁定期跳过，等锁过期
+                Thread.sleep(forTimeInterval: 0.02)
+            } catch {
+                totalFailures += 1
+            }
+            // 保险：避免死循环
+            if totalFailures == 0 {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        }
+
+        XCTAssertTrue(pc.isConsumed, "Code should be invalidated after max failures")
+        XCTAssertThrowsError(try pc.verify(pc.code))
+    }
+
     func testTokenGenerateAndVerify() {
         let token = PairingToken.generate(deviceName: "iPhone")
         let hash = token.hash()

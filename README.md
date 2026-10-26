@@ -132,7 +132,7 @@ let helloResponse = try await client.hello()
 let verifyResponse = try await client.verify(body: proofData)
 ```
 
-`HTTPPairingServer` parses minimal HTTP/1.1 requests and hands them to a handler. It only supports `Content-Length` bodies, not chunked encoding.
+`HTTPPairingServer` parses minimal HTTP/1.1 requests and hands them to a handler. It only supports `Content-Length` bodies, not chunked encoding. Requests whose body exceeds `maxBodySize` (1 MB) are rejected with `413` and the connection is closed immediately; malformed request lines get `400`. The parser is exposed as `internal` for unit tests.
 
 ```swift
 let server = HTTPPairingServer { request in
@@ -332,6 +332,8 @@ await channel.start()
 try await channel.send(.exec(id: "1", cmd: "ls -la", timeout: 10))
 ```
 
+Once a send fails, the channel records the error and rejects all subsequent sends with the same error instead of continuing with a gap in sequence numbers. Treat a `SecureChannel` send failure as terminal for that channel.
+
 ---
 
 ## Architecture
@@ -365,6 +367,7 @@ try await channel.send(.exec(id: "1", cmd: "ls -la", timeout: 10))
 - `ws://` does not authenticate the server at the transport layer. Use `wss://` or a VPN if you need transport-level identity.
 - Application-layer encryption protects message contents and integrity. It does not protect against a compromised server host.
 - The server stores token hashes only. The client stores the raw token in the Keychain.
+- A failed send is sticky: the channel refuses further sends to preserve sequence-number continuity, and the caller should tear it down.
 
 ---
 
@@ -383,3 +386,4 @@ Those belong to the host application.
 ## License
 
 MIT © 2026 CaoHaoran-Dev
+
