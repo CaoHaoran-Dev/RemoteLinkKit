@@ -14,6 +14,8 @@ public enum ServerMessage: Sendable, Equatable {
     case error(id: String?, message: String)
     case pong(timestamp: Date)
     case cwd(path: String)
+    /// 自定义业务消息。`type` 是业务子类型，`payload` 是序列化后的字节。
+    case custom(type: String, payload: Data)
 
     public enum Stream: String, Codable, Sendable {
         case stdout
@@ -27,13 +29,15 @@ public enum ServerMessage: Sendable, Equatable {
         case .error:  return .error
         case .pong:   return .pong
         case .cwd:    return .cwd
+        // 复用 .handshake（双向帧类型），避免改动 FrameType 枚举。
+        case .custom: return .handshake
         }
     }
 }
 
 extension ServerMessage: Codable {
     private enum CodingKeys: String, CodingKey {
-        case type, id, stream, data, exit, cwd, message, timestamp, path
+        case type, id, stream, data, exit, cwd, message, timestamp, path, payload, customType
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -59,6 +63,10 @@ extension ServerMessage: Codable {
         case .cwd(let path):
             try c.encode("cwd", forKey: .type)
             try c.encode(path, forKey: .path)
+        case .custom(let subType, let payload):
+            try c.encode("custom", forKey: .type)
+            try c.encode(subType, forKey: .customType)
+            try c.encode(payload.base64EncodedString(), forKey: .payload)
         }
     }
 
@@ -90,6 +98,10 @@ extension ServerMessage: Codable {
             self = .pong(timestamp: Date(timeIntervalSince1970: ts))
         case "cwd":
             self = .cwd(path: try c.decode(String.self, forKey: .path))
+        case "custom":
+            let subType = try c.decode(String.self, forKey: .customType)
+            let b64 = try c.decode(String.self, forKey: .payload)
+            self = .custom(type: subType, payload: Data(base64Encoded: b64) ?? Data())
         default:
             throw MessageError.unknownType(type)
         }

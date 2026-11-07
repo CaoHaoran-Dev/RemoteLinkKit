@@ -32,7 +32,7 @@ Both libraries are **UI-free**, **execution-free**, and **Network-framework-thin
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/CaoHaoran-Dev/RemoteLinkKit.git", from: "0.1.0")
+    .package(url: "https://github.com/CaoHaoran-Dev/RemoteLinkKit.git", from: "1.1.0")
 ]
 ```
 
@@ -268,6 +268,7 @@ Client to server:
 | `.exec(id, cmd, timeout)` | `.exec` | command, timeout |
 | `.cancel(id)` | `.cancel` | command id |
 | `.ping(timestamp)` | `.ping` | timestamp |
+| `.custom(type, payload)` | `.handshake` | arbitrary bytes |
 
 Server to client:
 
@@ -278,11 +279,47 @@ Server to client:
 | `.error(id, message)` | `.error` | error text |
 | `.pong(timestamp)` | `.pong` | timestamp |
 | `.cwd(path)` | `.cwd` | working directory |
+| `.custom(type, payload)` | `.handshake` | arbitrary bytes |
 
 ```swift
 let data = try MessageCodec.encode(ClientMessage.exec(id: "1", cmd: "ls", timeout: 10))
 let msg = try MessageCodec.decodeClient(data)
 ```
+
+### Custom payloads
+
+Both `ClientMessage` and `ServerMessage` expose a `.custom(type:payload:)` case for arbitrary application data — custom structs, file chunks, images — without leaving the encrypted channel.
+
+```swift
+// Any Codable struct
+struct FileChunk: Codable {
+    let name: String
+    let offset: Int
+    let bytes: Data
+}
+
+let chunk = FileChunk(name: "photo.png", offset: 0, bytes: pngData)
+let payload = try JSONEncoder().encode(chunk)
+try await channel.send(ClientMessage.custom(type: "file-chunk", payload: payload))
+```
+
+```swift
+// Receiving side
+await server.setOnClientMessage { msg in
+    if case .custom(let type, let data) = msg, type == "file-chunk" {
+        let chunk = try JSONDecoder().decode(FileChunk.self, from: data)
+        // handle chunk
+    }
+}
+```
+
+Wire format: `{"type":"custom","customType":"file-chunk","payload":"<base64>"}`. The JSON `"type"` key stays `"custom"`; the business subtype lives in `"customType"`, so the two never collide.
+
+Notes:
+
+- `payload` is a `Data` field and is **base64-encoded inside JSON**, adding ~33% overhead. For large binaries, split into chunks (≤ 256 KB per chunk recommended) and stay well under `Frame.maxPayloadSize` (16 MB).
+- `.custom` maps to `FrameType.handshake` on the wire, so no new frame type is introduced. `SecureChannel` treats it like any other message.
+- Mixed-version peers: an older peer that doesn't know `"type":"custom"` will throw `MessageError.unknownType`. Both ends must be on the same version.
 
 ### Replay protection
 
@@ -329,7 +366,8 @@ await channel.setOnError { error in
 }
 
 await channel.start()
-try await channel.send(.exec(id: "1", cmd: "ls -la", timeout: 10))
+try await channel.send(ClientMessage.exec(id: "1", cmd: "ls -la", timeout: 10))
+try await channel.send(ClientMessage.custom(type: "app", payload: myBytes))
 ```
 
 Once a send fails, the channel records the error and rejects all subsequent sends with the same error instead of continuing with a gap in sequence numbers. Treat a `SecureChannel` send failure as terminal for that channel.
@@ -368,6 +406,7 @@ Once a send fails, the channel records the error and rejects all subsequent send
 - Application-layer encryption protects message contents and integrity. It does not protect against a compromised server host.
 - The server stores token hashes only. The client stores the raw token in the Keychain.
 - A failed send is sticky: the channel refuses further sends to preserve sequence-number continuity, and the caller should tear it down.
+- Custom payloads (`.custom`) are encrypted and authenticated like any other message. The `customType` string is application-defined and not validated by the library.
 
 ---
 
@@ -380,6 +419,31 @@ Once a send fails, the channel records the error and rejects all subsequent send
 - Implement interactive TUI passthrough.
 
 Those belong to the host application.
+
+---
+
+## Testing
+
+```
+Tests/
+├── RemoteLinkKitTests/
+│   ├── ConnectionStateTests
+│   ├── ConnectionTransformTests
+│   ├── HeartbeatControllerTests
+│   ├── HTTPPairingServerTests      # parser boundaries: 400 / 413 / incomplete
+│   ├── ReconnectPolicyTests
+│   └── URLSessionTransportTests    # echo server: connect / send / receive / transform / state
+└── RemoteProcessProtocolTests/
+    ├── CipherSuiteTests
+    ├── FrameCodecTests
+    ├── MessageCodecTests           # includes custom payload round-trip
+    ├── PairingTests
+    ├── ReplayGuardTests
+    ├── SecureChannelTests
+    └── SecureChannelCustomTests    # custom payload through the encrypted channel
+```
+
+Run with `swift test` or via Xcode.
 
 ---
 
