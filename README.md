@@ -19,8 +19,8 @@ Both libraries are **UI-free**, **execution-free**, and **Network-framework-thin
 
 ## Requirements
 
-- macOS 12.4 or later
-- iOS 15 or later
+- macOS 13.0 or later
+- iOS 16.0 or later
 - Swift 5.9 or later
 - Xcode 15 or later (Tested with Xcode 26.3)
 

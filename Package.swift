@@ -4,8 +4,8 @@ import PackageDescription
 let package = Package(
     name: "RemoteLinkKit",
     platforms: [
-        .macOS(.v12),
-        .iOS(.v15)
+        .macOS(.v13),
+        .iOS(.v16)
     ],
     products: [
         .library(
