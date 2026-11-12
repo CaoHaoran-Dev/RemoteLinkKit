@@ -45,6 +45,22 @@ public final class NWTransport: RemoteConnection, @unchecked Sendable {
     public func connect() async throws {
         transition(.connecting)
 
+        // NWListener.newConnectionHandler 拿到的 NWConnection 可能已经 .ready。
+        // 此时再设 stateUpdateHandler 会错过 .ready 事件，continuation 永不 resume。
+        // 先检查当前 state，已 ready / 已失败直接返回。
+        switch connection.state {
+        case .ready:
+            transition(.connected)
+            receiveLoop()
+            return
+        case .failed(let error):
+            throw ConnectionError.receiveFailed(underlying: error)
+        case .cancelled:
+            throw ConnectionError.closed
+        default:
+            break
+        }
+
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             connection.stateUpdateHandler = { [weak self] state in
                 guard let self = self else { return }
