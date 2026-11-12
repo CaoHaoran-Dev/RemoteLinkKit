@@ -47,7 +47,6 @@ public final class NWTransport: RemoteConnection, @unchecked Sendable {
 
         // NWListener.newConnectionHandler 拿到的 NWConnection 可能已经 .ready。
         // 此时再设 stateUpdateHandler 会错过 .ready 事件，continuation 永不 resume。
-        // 先检查当前 state，已 ready / 已失败直接返回。
         switch connection.state {
         case .ready:
             transition(.connected)
@@ -61,26 +60,60 @@ public final class NWTransport: RemoteConnection, @unchecked Sendable {
             break
         }
 
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            connection.stateUpdateHandler = { [weak self] state in
-                guard let self = self else { return }
-                switch state {
-                case .ready:
-                    self.connection.stateUpdateHandler = nil
-                    cont.resume()
-                case .failed(let error):
-                    self.connection.stateUpdateHandler = nil
-                    cont.resume(throwing: ConnectionError.receiveFailed(underlying: error))
-                case .cancelled:
-                    self.connection.stateUpdateHandler = nil
-                    cont.resume(throwing: ConnectionError.closed)
-                default:
-                    break
+        // NWConnection 不保证 stateUpdateHandler 一定触发 .ready。
+        // 如果 NWListener 内部已经对 connection 调过 start，再调 start
+        // 可能不会重新触发 .ready，continuation 会永久挂起。
+        // 用 3 秒超时兜底：超时后不抛错，直接进入 connected 并启动接收循环。
+        // 如果连接实际不可用，receiveLoop 的 receiveMessage 会报错并走 handleDisconnect。
+        let ready: Bool = await withTaskGroup(of: Bool.self) { group in
+            group.addTask { [weak self] in
+                guard let self = self else { return false }
+                do {
+                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                        let resumed = LockedFlag()
+                        self.connection.stateUpdateHandler = { [weak self] state in
+                            guard let self = self else { return }
+                            switch state {
+                            case .ready:
+                                if resumed.trySet() {
+                                    self.connection.stateUpdateHandler = nil
+                                    cont.resume()
+                                }
+                            case .failed(let error):
+                                if resumed.trySet() {
+                                    self.connection.stateUpdateHandler = nil
+                                    cont.resume(throwing: ConnectionError.receiveFailed(underlying: error))
+                                }
+                            case .cancelled:
+                                if resumed.trySet() {
+                                    self.connection.stateUpdateHandler = nil
+                                    cont.resume(throwing: ConnectionError.closed)
+                                }
+                            default:
+                                break
+                            }
+                        }
+                        self.connection.start(queue: self.queue)
+                    }
+                    return true
+                } catch {
+                    return false
                 }
             }
-            connection.start(queue: queue)
+
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                return false
+            }
+
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
         }
 
+        // 无论是否等到 .ready，都继续启动接收循环。
+        // 连接实际可用时 receiveMessage 正常工作；不可用时立刻报错。
+        _ = ready
         transition(.connected)
         receiveLoop()
     }
@@ -127,8 +160,6 @@ public final class NWTransport: RemoteConnection, @unchecked Sendable {
         }
         guard shouldClose else { return }
 
-        // 发关闭帧。用局部 connection 强捕获，避免 transport 先释放导致
-        // cancel 不执行、NWConnection 泄漏。
         let conn = self.connection
 
         let metadata = NWProtocolWebSocket.Metadata(opcode: .close)
@@ -228,4 +259,21 @@ public final class NWTransport: RemoteConnection, @unchecked Sendable {
         handler?(newState)
     }
 }
+
+// MARK: - Helpers
+
+/// 只允许 set 一次，避免 continuation 被 resume 两次。
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    func trySet() -> Bool {
+        lock.withLock {
+            if value { return false }
+            value = true
+            return true
+        }
+    }
+}
+
 #endif
